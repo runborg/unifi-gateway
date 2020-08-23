@@ -3,3 +3,4 @@ MockSSH==1.4.5
 pycrypto==2.6.1
 Flask==0.12.2
 psutil==5.4.0
+pycryptodomex==3.9.8
