@@ -4,7 +4,13 @@ import time
 
 import struct
 
-from uptime import uptime
+
+def uptime():
+    with open('/proc/uptime', 'r') as f:
+        _ut, _ = f.readline().split(' ')
+        uptime_fl = float(_ut)
+        return int(uptime_fl)
+
 
 mac = [0x00, 0x0d, 0xb9, 0x47, 0x65, 0xf9]
 ip = [192, 168, 0, 225]

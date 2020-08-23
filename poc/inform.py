@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 import json
-import urllib2
+from urllib.request import urlopen, Request
 import sys
 import uuid
 
@@ -15,31 +15,48 @@ import time
 import binascii
 
 import psutil
-from Crypto import Random
-from Crypto.Cipher import AES
-from binascii import a2b_hex
+try:
+    # Try to load Cryptodome
+    from Cryptodome import Random
+    from Cryptodome.Cipher import AES
+except Exception:
+    # Fallback to PyCrypto
+    from Crypto import Random
+    from Crypto.Cipher import AES
 
+from binascii import a2b_hex
 from random import randint
 
-from uptime import uptime
+SUPPORT_GCM = bool('MODE_GCM' in dir(AES))
 
 
-def packet_encode(key, json):
+class encryptionError(Exception):
+    pass
+
+
+def uptime():
+    with open('/proc/uptime', 'r') as f:
+        _ut, _ = f.readline().split(' ')
+        uptime_fl = float(_ut)
+        return int(uptime_fl)
+
+
+def packet_encode(key, data, mac=b'000000000000'):
     iv = Random.new().read(16)
 
     # zlib compression
-    payload = zlib.compress(json)
+    payload = zlib.compress(data)
     # padding - http://stackoverflow.com/a/14205319
     pad_len = AES.block_size - (len(payload) % AES.block_size)
-    payload += chr(pad_len) * pad_len
+    payload += bytearray([pad_len for i in range(pad_len)])
     # encryption
     payload = AES.new(key, AES.MODE_CBC, iv).encrypt(payload)
 
     # encode packet
-    data = 'TNBU'                     # magic
+    data = b'TNBU'                    # magic
     data += pack('>I', 1)             # packet version
-    data += pack('BBBBBB', *(0x00, 0x0d, 0xb9, 0x47, 0x65, 0xf9))   # mac address
-    data += pack('>H', 3)             # flags
+    data += pack('BBBBBB', *a2b_hex(mac))   # mac address
+    data += pack('>H', 0x03)          # flags
     data += iv                        # encryption iv
     data += pack('>I', 1)             # payload version
     data += pack('>I', len(payload))  # payload length
@@ -51,59 +68,132 @@ def packet_encode(key, json):
 def inform(url, key, json):
     headers = {
         'Content-Type': 'application/x-binary',
-        'User-Agent': 'AirControl Agent v1.0'
+        'User-Agent': 'AirControl Agent v1.0',
     }
     data = packet_encode(key, json)
-    req = urllib2.Request(url, data, headers)
+    req = Request(url, data, headers)
     print('send %s' % json)
     try:
-        res = urllib2.urlopen(req)
+        res = urlopen(req)
         return packet_decode(key, res.read())
     except Exception as a:
-        print a
+        print(a)
+
+
+class Mac():
+    def __init__(self, address):
+        if isinstance(address, tuple):
+            for i in address:
+                if not isinstance(i, int):
+                    raise ValueError('All elements in tuple needs to be a int')
+            self._address = address
+        elif isinstance(address, str):
+            try:
+                self._address = tuple([int(i,16) for i in address.split(':')])
+            except:
+                raise
+        else:
+            raise ValueError(f'Unable to decode address {repr(address)}')
+
+    def __repr__(self):
+        return 'Mac(%s)' % self.__str__()
+
+    def __str__(self):
+        return self.as_str()
+
+    def as_tuple(self):
+        return self._address
+
+    def as_bytes(self):
+        return b''.join([b'%02x' % i for i in self._address])
+
+    def as_str(self):
+        return ':'.join(['%02x' % i for i in self._address])
+
+
+def a2mac(a):
+    return tuple([int(i, 16) for i in a.split(':')])
 
 
 def mac2a(mac):
-    return ':'.join(map(lambda i: '%02x' %i, mac))
+    return ':'.join(map(lambda i: '%02x' % i, mac))
 
 
 def mac2serial(mac):
-    return ''.join(map(lambda i: '%02x'%i, mac))
+    return ''.join(map(lambda i: '%02x' % i, mac))
 
 
 def ip2a(ip):
     return '.'.join(map(str, ip))
 
 
+def a2ip(a):
+    return tuple([int(i) for i in a.split('.')])
+
+
+class InformPacket():
+    def __init__(self, flags, iv, version, payload_len, payload):
+        self.flags = flags
+        self.iv = iv
+        self.version = version
+        self.payload_len = payload_len
+        self.payload = payload
+
+    def __str__(self):
+        return self.payload.decode()
+
+    def __repr__(self):
+        return 'InformPacket()'
+
+
 def packet_decode(key, data, iv=None):
     magic = data[0:4]
-    if magic != 'TNBU':
+    if magic != b'TNBU':
         raise Exception("Missing magic in response: '%s' instead of 'TNBU'" %(magic))
-    mac = unpack('BBBBBB', data[8:14])
+    mac = bytes(unpack('BBBBBB', data[8:14]))
     # if mac != (0x00, 0x0d, 0xb9, 0x47, 0x65, 0xf9):
     #     raise Exception('Mac address changed in response: %s -> %s'%(mac2a((0x00, 0x0d, 0xb9, 0x47, 0x65, 0xf9)), mac2a(mac)))
 
+    header = data[:40]
     flags = unpack('>H', data[14:16])[0]
     iv = data[16:32] if not iv else iv
     version = unpack('>I', data[32:36])[0]
     payload_len = unpack('>I', data[36:40])[0]
     payload = data[40:(40+payload_len)]
 
-    print(binascii.hexlify(iv))
+    flag = {
+        'encrypted': bool(flags & 0x01),
+        'zlibCompressed': bool(flags & 0x02),
+        'SnappyCompression': bool(flags & 0x04),
+        'encryptedGCM': bool(flags & 0x08),
+    }
 
-    # decrypt if required
-    if flags & 0x01:
-        payload = AES.new(key, AES.MODE_CBC, iv).decrypt(payload)
-        # unpad - https://gist.github.com/marcoslin/8026990#file-server-py-L43
-        pad_size = ord(payload[-1])
-        if pad_size > AES.block_size:
-            raise Exception('Response not padded or padding is corrupt')
-        payload = payload[:(len(payload) - pad_size)]
+    if flag['encrypted']:
+        if flag['encryptedGCM']:
+            if not SUPPORT_GCM:
+                raise NotImplementedError('GCM Encryption is not in PyCrypt')
+            tag = payload[-16:]
+            payload = payload[:-16]
+            _aes = AES.new(key, AES.MODE_GCM, iv)
+            _aes.update(header)
+            payload = _aes.decrypt_and_verify(payload, tag)
+        else:
+            # Encrypted with AES encryption
+            payload = AES.new(key, AES.MODE_CBC, iv).decrypt(payload)
+            # unpad - https://gist.github.com/marcoslin/8026990#file-server-py-L43
+            pad_size = payload[-1]
+            if pad_size > AES.block_size:
+                raise encryptionError('Response not padded or padding is corrupt, possibly not decrypted correctly')
+            payload = payload[:(len(payload) - pad_size)]
+
     # uncompress if required
-    if flags & 0x02:
-        payload = zlib.decompress(payload)
+    if flag['zlibCompressed']:
+        try:
+            payload = zlib.decompress(payload)
+        except zlib.error:
+            raise encryptionError('Unable to uncompress data, possibly not decrypted correctly')
 
-    return payload
+    return InformPacket(flag, iv, version, payload_len, payload)
 
 
 def cfg_replace(fn, contents):
@@ -1350,7 +1440,7 @@ def send_inform(url, key, partial=False):
             'version': '4.3.49.5001150'
         })
 
-    response = inform(url, a2b_hex(key), value)
+    response = inform(url, a2b_hex(key), value.encode('utf-8'))
 
     if response:
         response = json.loads(response)
